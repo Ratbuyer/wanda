@@ -17,9 +17,16 @@ class TokenizerWrapper:
 
 # Load and process wikitext2 dataset
 def get_wikitext2(nsamples, seed, seqlen, tokenizer):
-    # Load train and test datasets
-    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+    # Path to local dataset
+    dataset_path = "/home/eddyluo/datasets/wikitext-2"  # Update if stored elsewhere
+
+    # Check if dataset exists locally
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Local dataset not found at {dataset_path}. Please download it manually.")
+
+    # Load dataset from local storage
+    traindata = load_from_disk(dataset_path)["train"]
+    testdata = load_from_disk(dataset_path)["test"]
 
     # Encode datasets
     trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
@@ -35,6 +42,7 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
         tar = inp.clone()
         tar[:, :-1] = -100
         trainloader.append((inp, tar))
+
     return trainloader, testenc
 
 # Load and process c4 dataset
