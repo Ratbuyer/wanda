@@ -128,20 +128,39 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
-    print("loading calibdation data")
+    print("loading calibration data")
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
+    
+    # Get model's attention implementation
+    if hasattr(model, "get_input_embeddings"):
+        embeddings = model.get_input_embeddings()
+        seq_length = model.seqlen
+        hidden_size = embeddings.embedding_dim
+    else:
+        raise ValueError("Model needs to have get_input_embeddings method")
+
     with torch.no_grad():
         inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+
+    # Create position embeddings cache
+    if hasattr(model.model.layers[0].self_attn, "rotary_emb"):
+        rotary_emb = model.model.layers[0].self_attn.rotary_emb
+        cos, sin = rotary_emb(inps, seq_len=model.seqlen)
+        position_embeddings = (cos, sin)
+    else:
+        position_embeddings = None
 
     layers = model.model.layers
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+        if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+            inps, outs, attention_mask = inps.to(dev), outs.to(dev), attention_mask.to(dev)
+            if position_embeddings is not None:
+                position_embeddings = (cos.to(dev), sin.to(dev))
 
         wrapped_layers = {}
         for name in subset:
@@ -155,19 +174,24 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         handles = []
         for name in wrapped_layers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
+        
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                if position_embeddings is not None:
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
+                else:
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                    
         for h in handles:
             h.remove()
 
+        # Rest of your pruning logic remains the same
         for name in subset:
             print(f"pruning layer {i} name {name}")
             W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
 
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+            W_mask = (torch.zeros_like(W_metric) == 1)
             if prune_n != 0:
-                # structured n:m sparsity
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
@@ -176,7 +200,6 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 sort_res = torch.sort(W_metric, dim=-1, stable=True)
 
                 if args.use_variant:
-                    # wanda variant 
                     tmp_metric = torch.cumsum(sort_res[0], dim=1)
                     sum_before = W_metric.sum(dim=1)
 
@@ -195,15 +218,17 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
                     print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
                 else:
-                    # unstructured pruning
                     indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
                     W_mask.scatter_(1, indices, True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            subset[name].weight.data[W_mask] = 0
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                if position_embeddings is not None:
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
+                else:
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache 
