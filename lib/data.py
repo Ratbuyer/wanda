@@ -4,6 +4,7 @@ import numpy as np
 import random
 import torch
 from datasets import load_dataset
+from datasets import load_from_disk
 
 # Set seed for reproducibility
 def set_seed(seed):
@@ -21,12 +22,12 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
     dataset_path = "/home/eddyluo/datasets/wikitext-2"  # Update if stored elsewhere
 
     # Check if dataset exists locally
-    if not os.path.exists(dataset_path):
-        raise FileNotFoundError(f"Local dataset not found at {dataset_path}. Please download it manually.")
+   # if not os.path.exists(dataset_path):
+    #    raise FileNotFoundError(f"Local dataset not found at {dataset_path}. Please download it manually.")
 
     # Load dataset from local storage
-    traindata = load_from_disk(dataset_path)["train"]
-    testdata = load_from_disk(dataset_path)["test"]
+    traindata = load_dataset(dataset_path, 'wikitext-2-raw-v1', split="train")
+    testdata = load_dataset(dataset_path, 'wikitext-2-raw-v1', split="test")
 
     # Encode datasets
     trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
