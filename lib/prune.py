@@ -135,14 +135,35 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
 
     layers = model.model.layers
+    
+    print("moving model to cpu")
+    model.to("cpu")
+
     for i in range(len(layers)):
+        print(f"Pruning layer {i}...")
         layer = layers[i]
         subset = find_layers(layer)
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+        if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+        else:
+            dev = torch.device("cuda:0")
+        
+        layer.to(dev)
 
+        inps, outs, attention_mask, position_ids = (
+            inps.to(dev),
+            outs.to(dev),
+            attention_mask.to(dev),
+            position_ids.to(dev),
+        )
+
+        
+        # if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+           # dev = model.hf_device_map[f"model.layers.{i}"]
+            #inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+        
+         
         wrapped_layers = {}
         for name in subset:
             wrapped_layers[name] = WrappedGPT(subset[name])
@@ -200,15 +221,112 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                     W_mask.scatter_(1, indices, True)
 
             subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+        #del wrapped_layers, inps, outs
+        #layer.to("cpu")  # Move pruned layer to CPU
+        #torch.cuda.empty_cache()  # Clear GPU memory
 
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+       # for j in range(args.nsamples):
+         #   with torch.no_grad():
+        #        outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+       # inps, outs = outs, inps
+
+        del wrapped_layers
+        layer.to("cpu")  # Move pruned layer back to CPU
+        torch.cuda.empty_cache()  # Free GPU memory
+
+        # Move activations to CPU before loading the next layer
+        inps = inps.to("cpu")
+        outs = outs.to("cpu")
+        attention_mask = attention_mask.to("cpu")
+        position_ids = position_ids.to("cpu")
+
+        #Preserve activations for the next layer
         inps, outs = outs, inps
+
 
     model.config.use_cache = use_cache 
     torch.cuda.empty_cache()
 
+
+def pprune_wanda(args, model, tokenizer, prune_n=0, prune_m=0):
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    print("Loading calibration data...")
+    dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
+    print("Dataset loading complete.")
+
+    with torch.no_grad():
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, "cpu")
+
+    layers = model.model.layers
+    model.to("cpu")  # Move full model to CPU before pruning
+
+    for i in range(len(layers)):  # Process one layer at a time
+        print(f"Pruning layer {i}...")
+
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        # Move only the current layer to GPU
+        dev = torch.device("cuda:0")  # Use first available GPU
+        layer.to(dev)
+        inps, outs, attention_mask, position_ids = (
+            inps.to(dev),
+            outs.to(dev),
+            attention_mask.to(dev),
+            position_ids.to(dev),
+        )
+
+        wrapped_layers = {name: WrappedGPT(subset[name]) for name in subset}
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = [subset[name].register_forward_hook(add_batch(name)) for name in wrapped_layers]
+
+        for j in range(args.nsamples):  # Forward pass for calibration
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+
+        for h in handles:
+            h.remove()
+
+        for name in subset:
+            print(f"Pruning layer {i}, name {name}...")
+            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
+
+            W_mask = torch.zeros_like(W_metric, dtype=torch.bool)
+
+            if prune_n != 0:
+                # Structured N:M pruning
+                for ii in range(W_metric.shape[1]):
+                    if ii % prune_m == 0:
+                        tmp = W_metric[:, ii : (ii + prune_m)].float()
+                        W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+            else:
+                # Unstructured pruning
+                sort_res = torch.sort(W_metric, dim=-1, stable=True)
+                indices = sort_res[1][:, : int(W_metric.shape[1] * args.sparsity_ratio)]
+                W_mask.scatter_(1, indices, True)
+
+            subset[name].weight.data[W_mask] = 0  # Set pruned weights to zero
+
+        # Free up GPU memory before processing the next layer
+        del wrapped_layers, inps, outs
+        layer.to("cpu")  # Move pruned layer to CPU
+        torch.cuda.empty_cache()  # Clear GPU memory
+
+        # Reload inps, outs for the next layer on CPU (move them to GPU in the next iteration)
+        inps, outs = (
+            torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=torch.float16, device="cpu"),
+            torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=torch.float16, device="cpu"),
+        )
+
+    model.config.use_cache = use_cache  # Restore model settings
+    torch.cuda.empty_cache()
 
 @torch.no_grad()
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):

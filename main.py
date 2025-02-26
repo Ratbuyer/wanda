@@ -7,6 +7,7 @@ from importlib.metadata import version
 
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 from lib.eval import eval_ppl, eval_zero_shot
+from accelerate import dispatch_model, infer_auto_device_map
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -20,6 +21,7 @@ def get_llm(model_name, cache_dir="llm_weights"):
         cache_dir=cache_dir, 
         low_cpu_mem_usage=True, 
         device_map="auto",
+        offload_folder=cache_dir + '/offload',
         local_files_only=True
     )
 
@@ -56,12 +58,17 @@ def main():
     model_name = args.model.split("/")[-1]
     print(f"loading llm model {args.model}")
     model = get_llm(args.model, args.cache_dir)
-    model.eval()
+    
+    device_map = infer_auto_device_map(model)
+
+    # model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
     device = torch.device("cuda:0")
-    if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
+    # device = torch.device("cpu")
+    if "70b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
         device = model.hf_device_map["lm_head"]
+        print("using multiple gpus")
     print("use device ", device)
 
     if args.sparsity_ratio != 0:
@@ -74,6 +81,11 @@ def main():
             prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif "ablate" in args.prune_method:
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+    
+    print("moving model back to gpu")
+    model = dispatch_model(model, device_map)
+
+    model.eval()
 
     ################################################################
     print("*"*30)
